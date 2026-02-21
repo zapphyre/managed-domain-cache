@@ -12,7 +12,6 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 public class DomainCacheRegistry {
 
-    // Inner class representing a single domain's graph
     private static class DomainGraph {
         final Map<Class<?>, List<Class<?>>> direct = new ConcurrentHashMap<>();
         final Map<Class<?>, Set<Class<?>>> closure = new ConcurrentHashMap<>();
@@ -21,17 +20,25 @@ public class DomainCacheRegistry {
 
     private final Map<String, DomainGraph> domains = new ConcurrentHashMap<>();
 
-    public DomainCacheRegistry(String[] basePackages) {
-        buildGraphs(basePackages);
+    public DomainCacheRegistry(Map<String, String[]> domainPackages) {
+        buildGraphs(domainPackages);
     }
 
-    private void buildGraphs(String[] basePackages) {
+    private void buildGraphs(Map<String, String[]> domainPackages) {
+        // Collect all packages to scan
+        Set<String> allPackages = new LinkedHashSet<>();
+        for (String[] packages : domainPackages.values()) {
+            allPackages.addAll(Arrays.asList(packages));
+        }
+
         ClassPathScanningCandidateComponentProvider scanner =
                 new ClassPathScanningCandidateComponentProvider(false);
         scanner.addIncludeFilter(new AnnotationTypeFilter(CacheManaged.class));
 
-        // First pass: collect all annotated classes and their dependants per domain
-        for (String basePackage : basePackages) {
+        // Temporary storage: domain -> list of classes with their dependants
+        Map<String, List<ClassInfo>> domainClasses = new HashMap<>();
+
+        for (String basePackage : allPackages) {
             for (BeanDefinition bd : scanner.findCandidateComponents(basePackage)) {
                 try {
                     Class<?> clazz = Class.forName(bd.getBeanClassName());
@@ -39,27 +46,47 @@ public class DomainCacheRegistry {
                     String domain = ann.domain();
                     List<Class<?>> dependants = Arrays.asList(ann.dependants());
 
-                    DomainGraph graph = domains.computeIfAbsent(domain, k -> new DomainGraph());
-                    graph.direct.put(clazz, dependants);
-                    graph.allClasses.add(clazz);
-                    graph.allClasses.addAll(dependants);
+                    domainClasses.computeIfAbsent(domain, k -> new ArrayList<>())
+                            .add(new ClassInfo(clazz, dependants));
+
                 } catch (ClassNotFoundException e) {
                     log.error("Failed to load class {}", bd.getBeanClassName(), e);
                 }
             }
         }
 
-        // Second pass: compute transitive closures for each domain
+        // Now build each domain's graph
+        for (Map.Entry<String, List<ClassInfo>> entry : domainClasses.entrySet()) {
+            String domain = entry.getKey();
+            DomainGraph graph = domains.computeIfAbsent(domain, k -> new DomainGraph());
+
+            for (ClassInfo info : entry.getValue()) {
+                graph.direct.put(info.clazz, info.dependants);
+                graph.allClasses.add(info.clazz);
+                graph.allClasses.addAll(info.dependants);
+            }
+        }
+
+        // Compute transitive closures for each domain
         domains.forEach((domain, graph) -> {
             graph.allClasses.forEach(cls -> getAffectedClasses(cls, domain));
             log.info("Domain '{}' initialized with {} classes", domain, graph.allClasses.size());
         });
     }
 
+    private static class ClassInfo {
+        final Class<?> clazz;
+        final List<Class<?>> dependants;
+        ClassInfo(Class<?> clazz, List<Class<?>> dependants) {
+            this.clazz = clazz;
+            this.dependants = dependants;
+        }
+    }
+
     public Set<Class<?>> getAffectedClasses(Class<?> clazz, String domain) {
         DomainGraph graph = domains.get(domain);
         if (graph == null) {
-            return Collections.singleton(clazz); // fallback: only itself
+            return Collections.singleton(clazz);
         }
         return graph.closure.computeIfAbsent(clazz, c -> buildClosure(c, graph));
     }
@@ -73,7 +100,7 @@ public class DomainCacheRegistry {
     private void buildClosureRecursive(Class<?> clazz, DomainGraph graph,
                                        Set<Class<?>> accumulator, Set<Class<?>> visiting) {
         if (!visiting.add(clazz)) {
-            log.warn("Cycle detected involving {} in domain", clazz);
+            log.warn("Cycle detected involving {}", clazz);
             return;
         }
         accumulator.add(clazz);
