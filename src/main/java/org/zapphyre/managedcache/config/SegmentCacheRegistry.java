@@ -10,43 +10,37 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
-public class DomainCacheRegistry {
+public class SegmentCacheRegistry {
 
-    private static class DomainGraph {
+    private static class SegmentGraph {
         final Map<Class<?>, List<Class<?>>> direct = new ConcurrentHashMap<>();
         final Map<Class<?>, Set<Class<?>>> closure = new ConcurrentHashMap<>();
         final Set<Class<?>> allClasses = ConcurrentHashMap.newKeySet();
     }
 
-    private final Map<String, DomainGraph> domains = new ConcurrentHashMap<>();
+    private final Map<String, SegmentGraph> segments = new ConcurrentHashMap<>();
 
-    public DomainCacheRegistry(Map<String, String[]> domainPackages) {
-        buildGraphs(domainPackages);
+    public SegmentCacheRegistry(String[] basePackages) {
+        buildGraphs(basePackages);
     }
 
-    private void buildGraphs(Map<String, String[]> domainPackages) {
-        // Collect all packages to scan
-        Set<String> allPackages = new LinkedHashSet<>();
-        for (String[] packages : domainPackages.values()) {
-            allPackages.addAll(Arrays.asList(packages));
-        }
-
+    private void buildGraphs(String[] basePackages) {
         ClassPathScanningCandidateComponentProvider scanner =
                 new ClassPathScanningCandidateComponentProvider(false);
         scanner.addIncludeFilter(new AnnotationTypeFilter(CacheManaged.class));
 
-        // Temporary storage: domain -> list of classes with their dependants
-        Map<String, List<ClassInfo>> domainClasses = new HashMap<>();
+        // Temporary: segment name -> list of (class, dependants)
+        Map<String, List<ClassInfo>> segmentClasses = new HashMap<>();
 
-        for (String basePackage : allPackages) {
+        for (String basePackage : basePackages) {
             for (BeanDefinition bd : scanner.findCandidateComponents(basePackage)) {
                 try {
                     Class<?> clazz = Class.forName(bd.getBeanClassName());
                     CacheManaged ann = clazz.getAnnotation(CacheManaged.class);
-                    String domain = ann.domain();
+                    String segment = ann.segment();
                     List<Class<?>> dependants = Arrays.asList(ann.dependants());
 
-                    domainClasses.computeIfAbsent(domain, k -> new ArrayList<>())
+                    segmentClasses.computeIfAbsent(segment, k -> new ArrayList<>())
                             .add(new ClassInfo(clazz, dependants));
 
                 } catch (ClassNotFoundException e) {
@@ -55,10 +49,10 @@ public class DomainCacheRegistry {
             }
         }
 
-        // Now build each domain's graph
-        for (Map.Entry<String, List<ClassInfo>> entry : domainClasses.entrySet()) {
-            String domain = entry.getKey();
-            DomainGraph graph = domains.computeIfAbsent(domain, k -> new DomainGraph());
+        // Build each segment's graph
+        for (Map.Entry<String, List<ClassInfo>> entry : segmentClasses.entrySet()) {
+            String segment = entry.getKey();
+            SegmentGraph graph = segments.computeIfAbsent(segment, k -> new SegmentGraph());
 
             for (ClassInfo info : entry.getValue()) {
                 graph.direct.put(info.clazz, info.dependants);
@@ -67,10 +61,10 @@ public class DomainCacheRegistry {
             }
         }
 
-        // Compute transitive closures for each domain
-        domains.forEach((domain, graph) -> {
-            graph.allClasses.forEach(cls -> getAffectedClasses(cls, domain));
-            log.info("Domain '{}' initialized with {} classes", domain, graph.allClasses.size());
+        // Compute transitive closures for each segment
+        segments.forEach((segment, graph) -> {
+            graph.allClasses.forEach(cls -> getAffectedClasses(cls, segment));
+            log.info("Segment '{}' initialized with {} classes", segment, graph.allClasses.size());
         });
     }
 
@@ -83,24 +77,24 @@ public class DomainCacheRegistry {
         }
     }
 
-    public Set<Class<?>> getAffectedClasses(Class<?> clazz, String domain) {
-        DomainGraph graph = domains.get(domain);
+    public Set<Class<?>> getAffectedClasses(Class<?> clazz, String segment) {
+        SegmentGraph graph = segments.get(segment);
         if (graph == null) {
-            return Collections.singleton(clazz);
+            return Collections.singleton(clazz); // fallback: only itself
         }
         return graph.closure.computeIfAbsent(clazz, c -> buildClosure(c, graph));
     }
 
-    private Set<Class<?>> buildClosure(Class<?> clazz, DomainGraph graph) {
+    private Set<Class<?>> buildClosure(Class<?> clazz, SegmentGraph graph) {
         Set<Class<?>> closure = new LinkedHashSet<>();
         buildClosureRecursive(clazz, graph, closure, new LinkedHashSet<>());
         return Collections.unmodifiableSet(closure);
     }
 
-    private void buildClosureRecursive(Class<?> clazz, DomainGraph graph,
+    private void buildClosureRecursive(Class<?> clazz, SegmentGraph graph,
                                        Set<Class<?>> accumulator, Set<Class<?>> visiting) {
         if (!visiting.add(clazz)) {
-            log.warn("Cycle detected involving {}", clazz);
+            log.warn("Cycle detected involving {} in segment", clazz);
             return;
         }
         accumulator.add(clazz);
@@ -111,8 +105,8 @@ public class DomainCacheRegistry {
         visiting.remove(clazz);
     }
 
-    public boolean isCacheable(Class<?> clazz, String domain) {
-        DomainGraph graph = domains.get(domain);
+    public boolean isCacheable(Class<?> clazz, String segment) {
+        SegmentGraph graph = segments.get(segment);
         return graph != null && graph.allClasses.contains(clazz);
     }
 }
