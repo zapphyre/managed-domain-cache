@@ -4,10 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.ProceedingJoinPoint;
-import org.aspectj.lang.annotation.AfterReturning;
-import org.aspectj.lang.annotation.Around;
-import org.aspectj.lang.annotation.Aspect;
-import org.aspectj.lang.annotation.Pointcut;
+import org.aspectj.lang.annotation.*;
 import org.aspectj.lang.reflect.MethodSignature;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -17,13 +14,11 @@ import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
 import org.zapphyre.managedcache.annotation.DomainCache;
+import org.zapphyre.managedcache.annotation.DomainCacheEvict;
 import org.zapphyre.managedcache.config.SegmentCacheRegistry;
-import org.zapphyre.managedcache.pojo.ECachingOperation;
 
 import java.lang.reflect.Method;
-import java.util.Collection;
-import java.util.Objects;
-import java.util.Optional;
+import java.util.*;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -37,19 +32,15 @@ public class ManagedCacheAspect {
     private final SegmentCacheRegistry segmentRegistry;
     private final SpelExpressionParser spel = new SpelExpressionParser();
 
+    // ============================================================
+    // READ: @DomainCache
+    // ============================================================
+
     @Pointcut("@annotation(domainCache)")
-    public void cacheableMethod(DomainCache domainCache) {}
+    public void readMethod(DomainCache domainCache) {}
 
-    // ============================================================
-    // READ
-    // ============================================================
-
-    @Around(value = "cacheableMethod(cfg)", argNames = "pjp, cfg")
+    @Around(value = "readMethod(cfg)", argNames = "pjp, cfg")
     public Object handleRead(ProceedingJoinPoint pjp, DomainCache cfg) throws Throwable {
-        if (cfg.operation() != ECachingOperation.READ) {
-            return pjp.proceed();
-        }
-
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
         Object[] args = pjp.getArgs();
         String segment = cfg.segment();
@@ -115,68 +106,103 @@ public class ManagedCacheAspect {
     }
 
     // ============================================================
-    // WRITE
+    // WRITE: @DomainCacheEvict
     // ============================================================
 
+    @Pointcut("@annotation(evictConfig)")
+    public void evictMethod(DomainCacheEvict evictConfig) {}
+
     @AfterReturning(
-            pointcut = "cacheableMethod(cfg)",
+            pointcut = "evictMethod(cfg)",
             returning = "result",
             argNames = "jp,cfg,result"
     )
-    public void handleWrite(JoinPoint jp,
-                            DomainCache cfg,
+    public void handleEvict(JoinPoint jp,
+                            DomainCacheEvict cfg,
                             Object result) {
-        if (cfg.operation() != ECachingOperation.WRITE) {
-            return;
-        }
-
         Method method = ((MethodSignature) jp.getSignature()).getMethod();
         Object[] args = jp.getArgs();
         String segment = cfg.segment();
 
-        Optional.ofNullable(extractWrittenEntityType(result, args, segment))
-                .filter(entityType -> segmentRegistry.isCacheable(entityType, segment))
-                .map(Class::getName)
-                .map(cacheManager::getCache)
-                .ifPresent(cache -> handleEviction(cfg, method, args, segment).accept(cache));
+        // Determine the entity type to evict
+        Class<?> entityType = determineEvictType(cfg, result, args, segment);
+        if (entityType == null) {
+            log.debug("No cacheable entity found for eviction in segment '{}'", segment);
+            return;
+        }
+
+        Cache cache = cacheManager.getCache(entityType.getName());
+        if (cache == null) {
+            log.debug("No cache region found for {}", entityType.getName());
+            return;
+        }
+
+        performEviction(cache, cfg, method, args, segment, entityType);
     }
 
-    private Consumer<Cache> handleEviction(DomainCache cfg,
-                                           Method method,
-                                           Object[] args,
-                                           String segment) {
-        return cache -> {
-            Object namedKey = generateKey(cfg.evictByName(), method, args);
+    private Class<?> determineEvictType(DomainCacheEvict cfg,
+                                        Object result,
+                                        Object[] args,
+                                        String segment) {
+        // 1. Explicit type from annotation (if not Object.class)
+        if (cfg.type() != Object.class && segmentRegistry.isCacheable(cfg.type(), segment)) {
+            return cfg.type();
+        }
 
-            if (namedKey != null) {
-                cache.evict(namedKey);
-                log.debug("Evicted [{}:{}] in segment '{}'", cache.getName(), namedKey, segment);
-                if (cfg.evictAtomic()) return;
+        // 2. Infer from result
+        Class<?> fromResult = extractEntityType(result);
+        if (fromResult != null && segmentRegistry.isCacheable(fromResult, segment)) {
+            return fromResult;
+        }
+
+        // 3. Infer from method arguments
+        for (Object arg : args) {
+            Class<?> type = extractEntityType(arg);
+            if (type != null && segmentRegistry.isCacheable(type, segment)) {
+                return type;
             }
+        }
 
-            if (cfg.evictAtomic()) {
-                cache.clear();
-                log.debug("Atomically cleared region [{}] in segment '{}'", cache.getName(), segment);
-                return;
+        return null;
+    }
+
+    private void performEviction(Cache cache,
+                                 DomainCacheEvict cfg,
+                                 Method method,
+                                 Object[] args,
+                                 String segment,
+                                 Class<?> entityType) {
+        // Named key eviction if specified
+        if (!cfg.key().isEmpty()) {
+            Object key = generateKey(cfg.key(), method, args);
+            if (key != null) {
+                cache.evict(key);
+                log.debug("Evicted [{}:{}] in segment '{}'", cache.getName(), key, segment);
+                if (cfg.atomic()) return; // atomic + named key: stop after named eviction
             }
+        }
 
-            Class<?> entityType = safeClass(cache.getName());
-            if (entityType == null) return;
+        // If atomic and no named key, clear entire region for this type
+        if (cfg.atomic()) {
+            cache.clear();
+            log.debug("Atomically cleared region [{}] in segment '{}'", cache.getName(), segment);
+            return;
+        }
 
-            segmentRegistry.getAffectedClasses(entityType, segment)
-                    .stream()
-                    .map(Class::getName)
-                    .map(cacheManager::getCache)
-                    .filter(Objects::nonNull)
-                    .forEach(c -> {
-                        c.clear();
-                        log.debug("Hierarchically cleared region [{}] in segment '{}'", c.getName(), segment);
-                    });
-        };
+        // Non-atomic: evict entire graph for this entity type
+        Set<Class<?>> affected = segmentRegistry.getAffectedClasses(entityType, segment);
+        affected.stream()
+                .map(Class::getName)
+                .map(cacheManager::getCache)
+                .filter(Objects::nonNull)
+                .forEach(c -> {
+                    c.clear();
+                    log.debug("Hierarchically cleared region [{}] in segment '{}'", c.getName(), segment);
+                });
     }
 
     // ============================================================
-    // ENTITY RESOLUTION
+    // Helper Methods (unchanged)
     // ============================================================
 
     private Class<?> resolveEntityType(Method method) {
@@ -196,34 +222,6 @@ public class ManagedCacheAspect {
         }
         return source.getClass();
     }
-
-    private Class<?> extractWrittenEntityType(Object result,
-                                              Object[] args,
-                                              String segment) {
-        Class<?> fromResult = extractEntityType(result);
-        if (fromResult != null && segmentRegistry.isCacheable(fromResult, segment)) {
-            return fromResult;
-        }
-        for (Object arg : args) {
-            Class<?> type = extractEntityType(arg);
-            if (type != null && segmentRegistry.isCacheable(type, segment)) {
-                return type;
-            }
-        }
-        return null;
-    }
-
-    private Class<?> safeClass(String fqcn) {
-        try {
-            return Class.forName(fqcn);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    // ============================================================
-    // KEY GENERATION
-    // ============================================================
 
     private Object generateKey(String expression,
                                Method method,
